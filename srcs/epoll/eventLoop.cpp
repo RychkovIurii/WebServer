@@ -40,14 +40,14 @@ void eventLoop(std::vector<ServerConfig> serverConfigs)
             
         for (int i = 0; i < nReady; i++)
         {
-            if (servers.find(eventLog[i].data.fd) != servers.end())
+            int fd = eventLog[i].data.fd;
+            if (servers.find(fd) != servers.end())
             {
-                serverSocket = eventLog[i].data.fd;
                 Client newClient;
-                int clientFd = acceptNewClient(loop, serverSocket, clients);
+                int clientFd = acceptNewClient(loop, fd, clients);
                 setup.data.fd = clientFd;
                 setup.events = EPOLLIN | EPOLLOUT;
-                newClient.serverInfo = servers[serverSocket];
+                newClient.serverInfo = servers[fd];
                 newClient.fd = clientFd;
                 if (epoll_ctl(loop, EPOLL_CTL_ADD, clientFd, &setup) < 0)
                     throw std::runtime_error("newClient epoll_ctl ADD failed");
@@ -56,15 +56,16 @@ void eventLoop(std::vector<ServerConfig> serverConfigs)
             }
             else
             {
+                Client& client = clients[fd];
                 if (eventLog[i].events & EPOLLIN)
                 {
                     std::cout << "EPOLLIN" << std::endl;
-                    handleClientRequest(clients[eventLog[i].data.fd], eventLog[i]);
+                    handleClientRequest(client, eventLog[i]);
                 }
                 if (eventLog[i].events & EPOLLOUT)
                 {
                     std::cout << "EPOLLOUT" << std::endl;
-                    handleClientRequestSend(clients[eventLog[i].data.fd], loop, eventLog[i]);
+                    handleClientRequestSend(client, loop, eventLog[i]);
                 }
             }
         }
@@ -119,23 +120,35 @@ static int acceptNewClient(int loop, int serverSocket, std::map<int, Client>& cl
     return newFd;
 }
 
-static void handleClientRequestSend(Client client, int loop, struct epoll_event& fdLog)
+void toggleEpollEvents(int fd, int loop, uint32_t events) {
+    struct epoll_event ev;
+    ev.data.fd = fd;
+    ev.events = events;
+    if (epoll_ctl(loop, EPOLL_CTL_MOD, fd, &ev) < 0)
+        throw std::runtime_error("epoll_ctl MOD failed");
+}
+
+static void handleClientRequestSend(Client &client, int loop)
 {
     std::cout << "Request received from client FD " << client.fd << std::endl;
-    // exit(0);
-
+    if (client.state != READY_TO_SEND || client.writeBuffer.empty())
+        return ;
     client.bytesWritten = send(client.fd, client.writeBuffer.data(), client.writeBuffer.size(), MSG_DONTWAIT);
     if (client.bytesWritten == 0)
     {
+        close(client.fd);
+        epoll_ctl(loop, EPOLL_CTL_DEL, client.fd, nullptr);
         return ;
     }
-    if (client.bytesWritten < 0)
-        throw std::runtime_error("header send failed"); //more comprehensive later
-    if (static_cast<size_t>(client.bytesWritten) == client.writeBuffer.size())
+    if (client.bytesWritten < 0) {
+        close(client.fd);
+        epoll_ctl(loop, EPOLL_CTL_DEL, client.fd, nullptr);
+        return;
+    }
+    client.writeBuffer.erase(0, bytes);
+    if (client.writeBuffer.empty())
     {
-        // client.reset();
-        // fdLog.events &= ~EPOLLOUT;
-        // return;
+        client.state = IDLE;
         auto it = client.request.headers.find("Connection");
         if (it->second == "close" || it->second == "Close" || client.request.version == "HTTP/1.0")
         {
@@ -145,14 +158,14 @@ static void handleClientRequestSend(Client client, int loop, struct epoll_event&
         }
         else
         {
-            std::cout << "NOTE: Exiting as request parsing not ready" << std::endl;
+            std::cout << "We don't close, only toggled." << std::endl;
             client.reset();
-            fdLog.events |= ~EPOLLOUT;
+            toggleEpollEvents(client.fd, epollFd, EPOLLIN);
         }
     }
 };
 
-static void handleClientRequest(Client client, struct epoll_event& fdLog)
+static void handleClientRequest(Client &client, int loop)
 {
     //std::cout << "Request received from client FD " << client.fd << std::endl;
     // std::cout << "NOTE: Exiting as request parsing not ready" << std::endl;
@@ -174,7 +187,9 @@ static void handleClientRequest(Client client, struct epoll_event& fdLog)
                 //if (errno == EAGAIN || errno == EWOULDBLOCK) //are we allowed to do this?
                     //return ;
                 //else
-                    throw std::runtime_error("header recv failed"); //more comprehensive later
+                close(client.fd);
+                epoll_ctl(loop, EPOLL_CTL_DEL, client.fd, nullptr);
+                return ;
             }
             buffer[client.bytesRead] = '\0';
             std::string temp(buffer, client.bytesRead);
@@ -194,10 +209,12 @@ static void handleClientRequest(Client client, struct epoll_event& fdLog)
                             client.state = READ_BODY;
                         else
                         {
+                            client.state = READY_TO_SEND;
                             client.request.body = std::string(client.readBuffer.begin(), client.readBuffer.end());
                             RequestHandler requestHandler;
                             HTTPResponse response = requestHandler.handleRequest(client.request, client.serverInfo);
                             client.writeBuffer = response.toString();
+                            toggleEpollEvents(client.fd, loop, EPOLLOUT);
                             return ;
                         }
                 }
@@ -209,27 +226,32 @@ static void handleClientRequest(Client client, struct epoll_event& fdLog)
         }
         case READ_BODY:
         {
-            if (client.readRaw.size() == stoul(client.request.headers["Content-Length"])) //or end of chunks?
+            if (client.readRaw.size() >= stoul(client.request.headers["Content-Length"])) //or end of chunks?
             {
                 client.request.body = std::string(client.readBuffer.begin(), client.readBuffer.end());
                 RequestHandler requestHandler;
                 HTTPResponse response = requestHandler.handleRequest(client.request, client.serverInfo);
                 client.writeBuffer = response.toString();
-                fdLog.events |= EPOLLOUT;
+                client.state = READY_TO_SEND;
+                toggleEpollEvents(client.fd, loop, EPOLLOUT);
                 return ;
             }
-            else
-                return ;
-            client.bytesRead = recv(client.fd, client.readBuffer.data(), client.readBuffer.size(), MSG_DONTWAIT);
+            client.bytesRead = 0;
+            char buffer2[READBUFFERSIZE];
+            client.bytesRead = recv(client.fd, buffer2, sizeof(buffer2) - 1, MSG_DONTWAIT);
             if (client.bytesRead < 0)
             {
                 //if (errno == EAGAIN || errno == EWOULDBLOCK) //are we allowed to do this?
                     //break ;
                 //else
-                     throw std::runtime_error("body recv failed"); //more comprehensive later
+                close(client.fd);
+                epoll_ctl(loop, EPOLL_CTL_DEL, client.fd, nullptr);
+                return ;
             }
+            buffer2[client.bytesRead] = '\0';
+            std::string temp(buffer, client.bytesRead);
+            client.readBuffer += temp;
             client.readRaw += client.readBuffer;
-            client.readBuffer[client.bytesRead] = '\0';
         }
     }
 };
