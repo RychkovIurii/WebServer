@@ -46,7 +46,7 @@ void eventLoop(std::vector<ServerConfig> serverConfigs)
                 Client newClient;
                 int clientFd = acceptNewClient(loop, serverSocket, clients);
                 setup.data.fd = clientFd;
-                setup.events = EPOLLIN | EPOLLOUT;
+                setup.events = EPOLLIN;
                 newClient.serverInfo = servers[serverSocket];
                 newClient.fd = clientFd;
                 if (epoll_ctl(loop, EPOLL_CTL_ADD, clientFd, &setup) < 0)
