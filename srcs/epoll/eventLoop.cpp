@@ -6,8 +6,8 @@
 void        eventLoop(std::vector<ServerConfig> servers);
 static int  initServerSocket(ServerConfig server);
 static int  acceptNewClient(int loop, int serverSocket, std::map<int, Client>& clients);
-static void handleClientRequest(Client client, struct epoll_event& fdLog);
-static void handleClientRequestSend(Client client, int loop, struct epoll_event& fdLog);
+static void handleClientRequest(Client &client, int loop);
+static void handleClientRequestSend(Client &client, int loop);
 
 void eventLoop(std::vector<ServerConfig> serverConfigs)
 {
@@ -46,7 +46,7 @@ void eventLoop(std::vector<ServerConfig> serverConfigs)
                 Client newClient;
                 int clientFd = acceptNewClient(loop, fd, clients);
                 setup.data.fd = clientFd;
-                setup.events = EPOLLIN | EPOLLOUT;
+                setup.events = EPOLLIN;
                 newClient.serverInfo = servers[fd];
                 newClient.fd = clientFd;
                 if (epoll_ctl(loop, EPOLL_CTL_ADD, clientFd, &setup) < 0)
@@ -60,12 +60,12 @@ void eventLoop(std::vector<ServerConfig> serverConfigs)
                 if (eventLog[i].events & EPOLLIN)
                 {
                     std::cout << "EPOLLIN" << std::endl;
-                    handleClientRequest(client, eventLog[i]);
+                    handleClientRequest(client, loop);
                 }
                 if (eventLog[i].events & EPOLLOUT)
                 {
                     std::cout << "EPOLLOUT" << std::endl;
-                    handleClientRequestSend(client, loop, eventLog[i]);
+                    handleClientRequestSend(client, loop);
                 }
             }
         }
@@ -145,7 +145,7 @@ static void handleClientRequestSend(Client &client, int loop)
         epoll_ctl(loop, EPOLL_CTL_DEL, client.fd, nullptr);
         return;
     }
-    client.writeBuffer.erase(0, bytes);
+    client.writeBuffer.erase(0, client.bytesWritten);
     if (client.writeBuffer.empty())
     {
         client.state = IDLE;
@@ -160,7 +160,7 @@ static void handleClientRequestSend(Client &client, int loop)
         {
             std::cout << "We don't close, only toggled." << std::endl;
             client.reset();
-            toggleEpollEvents(client.fd, epollFd, EPOLLIN);
+            toggleEpollEvents(client.fd, loop, EPOLLIN);
         }
     }
 };
@@ -187,6 +187,13 @@ static void handleClientRequest(Client &client, int loop)
                 //if (errno == EAGAIN || errno == EWOULDBLOCK) //are we allowed to do this?
                     //return ;
                 //else
+                close(client.fd);
+                epoll_ctl(loop, EPOLL_CTL_DEL, client.fd, nullptr);
+                return ;
+            }
+			if (client.bytesRead == 0)
+            {
+				// Client disconnected
                 close(client.fd);
                 epoll_ctl(loop, EPOLL_CTL_DEL, client.fd, nullptr);
                 return ;
@@ -249,9 +256,11 @@ static void handleClientRequest(Client &client, int loop)
                 return ;
             }
             buffer2[client.bytesRead] = '\0';
-            std::string temp(buffer, client.bytesRead);
+            std::string temp(buffer2, client.bytesRead);
             client.readBuffer += temp;
             client.readRaw += client.readBuffer;
         }
+		case READY_TO_SEND:
+			return;
     }
 };
